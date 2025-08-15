@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -201,3 +201,113 @@ def pdm_score_from_interpolated_trajectory(
                 pdm_result.at[0, column] = 1
 
     return pdm_result, simulated_states[pred_idx]
+
+
+def pdm_score_batch(
+    metric_caches: List[MetricCache],
+    model_trajectories: List[Trajectory],
+    future_sampling: TrajectorySampling,
+    simulator: PDMSimulator,
+    scorer: PDMScorer,
+    traffic_agents_policy: AbstractTrafficAgentsPolicy,
+) -> List[Tuple[pd.DataFrame, npt.NDArray[np.float64]]]:
+    """
+    Batch version of PDM scoring that leverages existing batch simulation capabilities.
+    :param metric_caches: List of metric cache dataclasses for each scene.
+    :param model_trajectories: List of predicted trajectories in ego frame.
+    :param future_sampling: Sampling configuration of trajectories.
+    :param simulator: Simulator applied on trajectories.
+    :param scorer: Scoring object to retrieve the sub-scores.
+    :param traffic_agents_policy: Background traffic policy.
+    :return: List of (PDM scores, simulated states) for each scene.
+    """
+    if not metric_caches or len(metric_caches) != len(model_trajectories):
+        raise ValueError("metric_caches and model_trajectories must have the same length")
+    
+    results = []
+    batch_size = len(metric_caches)
+    
+    # Prepare batch data
+    batch_trajectory_states = []
+    batch_initial_ego_states = []
+    
+    for metric_cache, model_trajectory in zip(metric_caches, model_trajectories):
+        initial_ego_state = metric_cache.ego_state
+        pred_trajectory = transform_trajectory(model_trajectory, initial_ego_state)
+        pdm_trajectory = metric_cache.trajectory
+        
+        pdm_states, pred_states = (
+            get_trajectory_as_array(pdm_trajectory, future_sampling, initial_ego_state.time_point),
+            get_trajectory_as_array(pred_trajectory, future_sampling, initial_ego_state.time_point),
+        )
+        trajectory_states = np.concatenate([pdm_states[None, ...], pred_states[None, ...]], axis=0)
+        
+        batch_trajectory_states.append(trajectory_states)
+        batch_initial_ego_states.append(initial_ego_state)
+    
+    # Batch simulation for all scenes
+    # Note: PDMSimulator.simulate_proposals expects states for a single scene with multiple proposals
+    # We need to process scenes individually but can batch within each scene's proposals
+    batch_simulated_states = []
+    
+    for trajectory_states, initial_ego_state in zip(batch_trajectory_states, batch_initial_ego_states):
+        simulated_states = simulator.simulate_proposals(trajectory_states, initial_ego_state)
+        batch_simulated_states.append(simulated_states)
+    
+    # Process each scene's results  
+    for i, (metric_cache, simulated_states) in enumerate(zip(metric_caches, batch_simulated_states)):
+        try:
+            # Traffic agents simulation
+            simulated_agent_detections_tracks = traffic_agents_policy.simulate_environment(
+                simulated_states[1], metric_cache
+            )
+            
+            # PDM scoring
+            pred_idx = 1  # index of predicted trajectory
+            pdm_result = scorer.score_proposals(
+                simulated_states,
+                metric_cache.observation,
+                metric_cache.centerline,
+                metric_cache.route_lane_ids,
+                metric_cache.drivable_area_map,
+                metric_cache.map_parameters,
+                simulated_agent_detections_tracks,
+                metric_cache.past_human_trajectory,
+            )[pred_idx]
+            
+            # Human penalty filter (if enabled)
+            if scorer._config.human_penalty_filter and metric_cache.scene_type == SceneFrameType.ORIGINAL:
+                human_trajectory = transform_trajectory(metric_cache.human_trajectory, metric_cache.ego_state)
+                human_states = get_trajectory_as_array(
+                    human_trajectory, future_sampling, metric_cache.ego_state.time_point
+                )
+                human_simulated_states = simulator.simulate_proposals(human_states[None, ...], metric_cache.ego_state)
+                human_simulated_agent_detections_tracks = traffic_agents_policy.simulate_environment(
+                    human_simulated_states[0], metric_cache
+                )
+                human_pdm_result = scorer.score_proposals(
+                    human_simulated_states,
+                    metric_cache.observation,
+                    metric_cache.centerline,
+                    metric_cache.route_lane_ids,
+                    metric_cache.drivable_area_map,
+                    metric_cache.map_parameters,
+                    human_simulated_agent_detections_tracks,
+                )[0]
+                
+                for column in human_pdm_result.columns:
+                    if column in ["multiplicative_metrics_prod", "weighted_metrics", "weighted_metrics_array"]:
+                        continue
+                    if human_pdm_result[column].iloc[0] == 0:
+                        pdm_result.at[0, column] = 1
+            
+            results.append((pdm_result, simulated_states[pred_idx]))
+            
+        except Exception as e:
+            # Handle failed scoring
+            from navsim.common.dataclasses import PDMResults
+            empty_result = pd.DataFrame([PDMResults.get_empty_results()])
+            empty_states = np.zeros((future_sampling.num_poses + 1, 7))  # Default state array size
+            results.append((empty_result, empty_states))
+    
+    return results

@@ -22,7 +22,7 @@ from navsim.agents.abstract_agent import AbstractAgent
 from navsim.common.dataclasses import PDMResults, SensorConfig
 from navsim.common.dataloader import MetricCacheLoader, SceneFilter, SceneLoader
 from navsim.common.enums import SceneFrameType
-from navsim.evaluate.pdm_score import pdm_score
+from navsim.evaluate.pdm_score import pdm_score, pdm_score_batch
 from navsim.planning.script.builders.worker_pool_builder import build_worker
 from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PDMScorer
 from navsim.planning.simulation.planner.pdm_planner.scoring.scene_aggregator import SceneAggregator
@@ -34,6 +34,151 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "config/pdm_scoring"
 CONFIG_NAME = "default_run_pdm_score"
+
+
+def process_tokens_batch(
+    tokens: List[str],
+    agent: AbstractAgent,
+    scene_loader: SceneLoader,
+    metric_cache_loader: MetricCacheLoader,
+    simulator: PDMSimulator,
+    scorer: PDMScorer,
+    traffic_agents_policy: AbstractTrafficAgentsPolicy,
+    batch_size: int = 32,
+) -> List[pd.DataFrame]:
+    """
+    Process multiple tokens in batches for GPU acceleration.
+    """
+    pdm_results = []
+    
+    for i in range(0, len(tokens), batch_size):
+        batch_tokens = tokens[i:i + batch_size]
+        logger.info(f"Processing batch {i//batch_size + 1}/{(len(tokens) + batch_size - 1)//batch_size} with {len(batch_tokens)} scenes")
+        
+        # Prepare batch data
+        batch_metric_caches = []
+        batch_agent_inputs = []
+        batch_scenes = []
+        valid_tokens = []
+        
+        for token in batch_tokens:
+            try:
+                metric_cache = metric_cache_loader.get_from_token(token)
+                agent_input = scene_loader.get_agent_input_from_token(token)
+                
+                batch_metric_caches.append(metric_cache)
+                batch_agent_inputs.append(agent_input)
+                valid_tokens.append(token)
+                
+                if agent.requires_scene:
+                    scene = scene_loader.get_scene_from_token(token)
+                    batch_scenes.append(scene)
+                    
+            except Exception as e:
+                logger.warning(f"Failed to load data for token {token}: {e}")
+                # Add empty results for failed tokens
+                score_row = pd.DataFrame([PDMResults.get_empty_results()])
+                score_row["valid"] = False
+                score_row["token"] = token
+                pdm_results.append(score_row)
+        
+        if not valid_tokens:
+            continue
+            
+        try:
+            # Batch trajectory computation
+            if agent.requires_scene:
+                # For agents requiring scene, fall back to individual processing
+                trajectories = []
+                for agent_input, scene in zip(batch_agent_inputs, batch_scenes):
+                    trajectories.append(agent.compute_trajectory(agent_input, scene))
+            else:
+                # Use batch processing for agents not requiring scene
+                trajectories = agent.compute_trajectories_batch(batch_agent_inputs)
+            
+            # Batch PDM scoring for all trajectories
+            try:
+                batch_scores = pdm_score_batch(
+                    metric_caches=batch_metric_caches,
+                    model_trajectories=trajectories,
+                    future_sampling=simulator.proposal_sampling,
+                    simulator=simulator,
+                    scorer=scorer,
+                    traffic_agents_policy=traffic_agents_policy,
+                )
+                
+                # Process batch results
+                for token, metric_cache, trajectory, (score_row, ego_simulated_states) in zip(
+                    valid_tokens, batch_metric_caches, trajectories, batch_scores
+                ):
+                    score_row["valid"] = True
+                    score_row["log_name"] = metric_cache.log_name
+                    score_row["frame_type"] = metric_cache.scene_type
+                    score_row["start_time"] = metric_cache.timepoint.time_s
+                    
+                    end_pose = StateSE2(
+                        x=trajectory.poses[-1, 0],
+                        y=trajectory.poses[-1, 1],
+                        heading=trajectory.poses[-1, 2],
+                    )
+                    absolute_endpoint = relative_to_absolute_poses(metric_cache.ego_state.rear_axle, [end_pose])[0]
+                    score_row["endpoint_x"] = absolute_endpoint.x
+                    score_row["endpoint_y"] = absolute_endpoint.y
+                    score_row["start_point_x"] = metric_cache.ego_state.rear_axle.x
+                    score_row["start_point_y"] = metric_cache.ego_state.rear_axle.y
+                    score_row["ego_simulated_states"] = [ego_simulated_states]
+                    score_row["token"] = token
+                    
+                    pdm_results.append(score_row)
+                    
+            except Exception as e:
+                logger.warning(f"Batch PDM scoring failed: {e}")
+                # Fall back to individual scoring
+                for token, metric_cache, trajectory in zip(valid_tokens, batch_metric_caches, trajectories):
+                    try:
+                        score_row, ego_simulated_states = pdm_score(
+                            metric_cache=metric_cache,
+                            model_trajectory=trajectory,
+                            future_sampling=simulator.proposal_sampling,
+                            simulator=simulator,
+                            scorer=scorer,
+                            traffic_agents_policy=traffic_agents_policy,
+                        )
+                        score_row["valid"] = True
+                        score_row["log_name"] = metric_cache.log_name
+                        score_row["frame_type"] = metric_cache.scene_type
+                        score_row["start_time"] = metric_cache.timepoint.time_s
+                        
+                        end_pose = StateSE2(
+                            x=trajectory.poses[-1, 0],
+                            y=trajectory.poses[-1, 1],
+                            heading=trajectory.poses[-1, 2],
+                        )
+                        absolute_endpoint = relative_to_absolute_poses(metric_cache.ego_state.rear_axle, [end_pose])[0]
+                        score_row["endpoint_x"] = absolute_endpoint.x
+                        score_row["endpoint_y"] = absolute_endpoint.y
+                        score_row["start_point_x"] = metric_cache.ego_state.rear_axle.x
+                        score_row["start_point_y"] = metric_cache.ego_state.rear_axle.y
+                        score_row["ego_simulated_states"] = [ego_simulated_states]
+                        
+                    except Exception as e:
+                        logger.warning(f"Individual PDM scoring failed for token {token}: {e}")
+                        score_row = pd.DataFrame([PDMResults.get_empty_results()])
+                        score_row["valid"] = False
+                    
+                    score_row["token"] = token
+                    pdm_results.append(score_row)
+                
+        except Exception as e:
+            logger.warning(f"Batch processing failed: {e}")
+            # Fall back to individual processing for this batch
+            for token in valid_tokens:
+                score_row = pd.DataFrame([PDMResults.get_empty_results()])
+                score_row["valid"] = False
+                score_row["token"] = token
+                pdm_results.append(score_row)
+    
+    return pdm_results
 
 
 def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[pd.DataFrame]:
@@ -77,52 +222,19 @@ def run_pdm_score(args: List[Dict[str, Union[List[str], DictConfig]]]) -> List[p
     )
 
     tokens_to_evaluate = list(set(scene_loader.tokens) & set(metric_cache_loader.tokens))
-    pdm_results: List[pd.DataFrame] = []
-    for idx, (token) in enumerate(tokens_to_evaluate):
-        logger.info(
-            f"Processing scenario {idx + 1} / {len(tokens_to_evaluate)} in thread_id={thread_id}, node_id={node_id}"
-        )
-        try:
-            metric_cache = metric_cache_loader.get_from_token(token)
-            agent_input = scene_loader.get_agent_input_from_token(token)
-            if agent.requires_scene:
-                scene = scene_loader.get_scene_from_token(token)
-                trajectory = agent.compute_trajectory(agent_input, scene)
-            else:
-                trajectory = agent.compute_trajectory(agent_input)
-
-            score_row, ego_simulated_states = pdm_score(
-                metric_cache=metric_cache,
-                model_trajectory=trajectory,
-                future_sampling=simulator.proposal_sampling,
-                simulator=simulator,
-                scorer=scorer,
-                traffic_agents_policy=traffic_agents_policy,
-            )
-            score_row["valid"] = True
-            score_row["log_name"] = metric_cache.log_name
-            score_row["frame_type"] = metric_cache.scene_type
-            score_row["start_time"] = metric_cache.timepoint.time_s
-            end_pose = StateSE2(
-                x=trajectory.poses[-1, 0],
-                y=trajectory.poses[-1, 1],
-                heading=trajectory.poses[-1, 2],
-            )
-            absolute_endpoint = relative_to_absolute_poses(metric_cache.ego_state.rear_axle, [end_pose])[0]
-            score_row["endpoint_x"] = absolute_endpoint.x
-            score_row["endpoint_y"] = absolute_endpoint.y
-            score_row["start_point_x"] = metric_cache.ego_state.rear_axle.x
-            score_row["start_point_y"] = metric_cache.ego_state.rear_axle.y
-            score_row["ego_simulated_states"] = [ego_simulated_states]  # used for two-frames extended comfort
-
-        except Exception:
-            logger.warning(f"----------- Agent failed for token {token}:")
-            traceback.print_exc()
-            score_row = pd.DataFrame([PDMResults.get_empty_results()])
-            score_row["valid"] = False
-        score_row["token"] = token
-
-        pdm_results.append(score_row)
+    logger.info(f"Processing {len(tokens_to_evaluate)} scenarios in batches in thread_id={thread_id}, node_id={node_id}")
+    
+    # Use batch processing
+    pdm_results = process_tokens_batch(
+        tokens=tokens_to_evaluate,
+        agent=agent,
+        scene_loader=scene_loader,
+        metric_cache_loader=metric_cache_loader,
+        simulator=simulator,
+        scorer=scorer,
+        traffic_agents_policy=traffic_agents_policy,
+        batch_size=32,  # Configurable batch size
+    )
     return pdm_results
 
 

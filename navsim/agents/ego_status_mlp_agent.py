@@ -28,6 +28,32 @@ class EgoStatusFeatureBuilder(AbstractFeatureBuilder):
         driving_command = torch.tensor(ego_status.driving_command)
         ego_status_feature = torch.cat([velocity, acceleration, driving_command], dim=-1)
         return {"ego_status": ego_status_feature}
+    
+    def compute_features_batch(self, agent_inputs: List[AgentInput]) -> Dict[str, torch.Tensor]:
+        """Optimized batch feature computation for ego status."""
+        if not agent_inputs:
+            return {}
+        
+        # Extract all ego statuses at once
+        velocities = []
+        accelerations = []
+        driving_commands = []
+        
+        for agent_input in agent_inputs:
+            ego_status = agent_input.ego_statuses[-1]
+            velocities.append(ego_status.ego_velocity)
+            accelerations.append(ego_status.ego_acceleration)
+            driving_commands.append(ego_status.driving_command)
+        
+        # Convert to tensors in parallel
+        velocity_tensor = torch.tensor(velocities, dtype=torch.float32)      # [batch_size, 2]
+        acceleration_tensor = torch.tensor(accelerations, dtype=torch.float32)  # [batch_size, 2]
+        driving_command_tensor = torch.tensor(driving_commands, dtype=torch.float32)  # [batch_size, 3]
+        
+        # Concatenate along feature dimension
+        ego_status_features = torch.cat([velocity_tensor, acceleration_tensor, driving_command_tensor], dim=-1)
+        
+        return {"ego_status": ego_status_features}
 
 
 class TrajectoryTargetBuilder(AbstractTargetBuilder):

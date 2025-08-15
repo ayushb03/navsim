@@ -83,6 +83,39 @@ class AbstractAgent(torch.nn.Module, ABC):
         # extract trajectory
         return Trajectory(poses, self._trajectory_sampling)
 
+    def compute_trajectories_batch(self, agent_inputs: List[AgentInput]) -> List[Trajectory]:
+        """
+        Computes ego vehicle trajectories for multiple scenes in a single batch.
+        :param agent_inputs: List of AgentInput dataclasses for multiple scenes.
+        :return: List of Trajectory objects for each scene.
+        """
+        if not agent_inputs:
+            return []
+        
+        # Use single trajectory computation for single input to maintain compatibility
+        if len(agent_inputs) == 1:
+            return [self.compute_trajectory(agent_inputs[0])]
+        
+        self.eval()
+        
+        # Build features for entire batch using parallel feature builders
+        batched_features: Dict[str, torch.Tensor] = {}
+        for builder in self.get_feature_builders():
+            builder_features = builder.compute_features_batch(agent_inputs)
+            batched_features.update(builder_features)
+        
+        # Single forward pass for entire batch
+        with torch.no_grad():
+            predictions = self.forward(batched_features)
+            batch_poses = predictions["trajectory"].numpy()  # Shape: [batch_size, num_poses, 3]
+        
+        # Extract individual trajectories
+        trajectories = []
+        for poses in batch_poses:
+            trajectories.append(Trajectory(poses, self._trajectory_sampling))
+        
+        return trajectories
+
     def compute_loss(
         self,
         features: Dict[str, torch.Tensor],
