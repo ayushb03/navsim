@@ -3,7 +3,7 @@ import os
 import pickle
 import traceback
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 import hydra
 from hydra.utils import instantiate
@@ -18,6 +18,55 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "config/pdm_scoring"
 CONFIG_NAME = "default_run_create_submission_pickle"
+
+
+def process_tokens_batch_submission(
+    tokens: List[str], agent: AbstractAgent, input_loader, batch_size: int = 32
+) -> Dict[str, Trajectory]:
+    """
+    Process tokens in batches for faster submission generation.
+    """
+    trajectories_output: Dict[str, Trajectory] = {}
+    
+    for i in range(0, len(tokens), batch_size):
+        batch_tokens = tokens[i:i + batch_size]
+        logger.info(f"Processing batch {i//batch_size + 1}/{(len(tokens) + batch_size - 1)//batch_size} with {len(batch_tokens)} tokens")
+        
+        # Prepare batch data
+        batch_agent_inputs = []
+        valid_tokens = []
+        
+        for token in batch_tokens:
+            try:
+                agent_input = input_loader.get_agent_input_from_token(token)
+                batch_agent_inputs.append(agent_input)
+                valid_tokens.append(token)
+            except Exception as e:
+                logger.warning(f"Failed to load data for token {token}: {e}")
+        
+        if not valid_tokens:
+            continue
+            
+        try:
+            # Batch trajectory computation
+            trajectories = agent.compute_trajectories_batch(batch_agent_inputs)
+            
+            # Update results
+            for token, trajectory in zip(valid_tokens, trajectories):
+                trajectories_output[token] = trajectory
+                
+        except Exception as e:
+            logger.warning(f"Batch processing failed: {e}")
+            # Fall back to individual processing
+            for token, agent_input in zip(valid_tokens, batch_agent_inputs):
+                try:
+                    trajectory = agent.compute_trajectory(agent_input)
+                    trajectories_output[token] = trajectory
+                except Exception:
+                    logger.warning(f"----------- Agent failed for token {token}:")
+                    traceback.print_exc()
+    
+    return trajectories_output
 
 
 def run_test_evaluation(
@@ -55,30 +104,24 @@ def run_test_evaluation(
     )
     agent.initialize()
 
-    # first stage output
-    first_stage_output: Dict[str, Trajectory] = {}
-    for token in tqdm(input_loader.tokens_stage_one, desc="Running first stage evaluation"):
-        try:
-            agent_input = input_loader.get_agent_input_from_token(token)
-            trajectory = agent.compute_trajectory(agent_input)
-            first_stage_output.update({token: trajectory})
-        except Exception:
-            logger.warning(f"----------- Agent failed for token {token}:")
-            traceback.print_exc()
+    # Process first stage with batching
+    logger.info("Processing first stage with batch processing")
+    first_stage_output = process_tokens_batch_submission(
+        tokens=input_loader.tokens_stage_one,
+        agent=agent,
+        input_loader=input_loader,
+        batch_size=32
+    )
 
-    # second stage output
-
+    # Process second stage with batching
+    logger.info("Processing second stage with batch processing")
     scene_loader_tokens_stage_two = input_loader.reactive_tokens_stage_two
-
-    second_stage_output: Dict[str, Trajectory] = {}
-    for token in tqdm(scene_loader_tokens_stage_two, desc="Running second stage evaluation"):
-        try:
-            agent_input = input_loader.get_agent_input_from_token(token)
-            trajectory = agent.compute_trajectory(agent_input)
-            second_stage_output.update({token: trajectory})
-        except Exception:
-            logger.warning(f"----------- Agent failed for token {token}:")
-            traceback.print_exc()
+    second_stage_output = process_tokens_batch_submission(
+        tokens=scene_loader_tokens_stage_two,
+        agent=agent,
+        input_loader=input_loader,
+        batch_size=32
+    )
 
     return first_stage_output, second_stage_output
 

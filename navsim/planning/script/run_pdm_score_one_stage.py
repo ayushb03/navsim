@@ -88,12 +88,10 @@ def process_tokens_batch(
         try:
             # Batch trajectory computation
             if agent.requires_scene:
-                # For agents requiring scene, fall back to individual processing
-                trajectories = []
-                for agent_input, scene in zip(batch_agent_inputs, batch_scenes):
-                    trajectories.append(agent.compute_trajectory(agent_input, scene))
+                # Use new batch scene processing for better performance
+                trajectories = agent.compute_trajectories_batch_with_scenes(batch_agent_inputs, batch_scenes)
             else:
-                # Use batch processing for agents not requiring scene
+                # Use regular batch processing for agents not requiring scene
                 trajectories = agent.compute_trajectories_batch(batch_agent_inputs)
             
             # Batch PDM scoring for all trajectories

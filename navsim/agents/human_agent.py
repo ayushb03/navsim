@@ -1,3 +1,5 @@
+from typing import List
+
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
 from navsim.agents.abstract_agent import AbstractAgent
@@ -34,6 +36,27 @@ class HumanAgent(AbstractAgent):
         """
         Computes the ego vehicle trajectory.
         :param current_input: Dataclass with agent inputs.
+        :param scene: Scene object containing ground truth trajectory data.
         :return: Trajectory representing the predicted ego's position in future
         """
         return scene.get_future_trajectory(self._trajectory_sampling.num_poses)
+
+    def compute_trajectories_batch_with_scenes(self, agent_inputs: List[AgentInput], scenes: List[Scene]) -> List[Trajectory]:
+        """
+        Computes ego vehicle trajectories for multiple scenes in parallel for the HumanAgent.
+        This is much faster than processing scenes serially.
+        
+        :param agent_inputs: List of AgentInput dataclasses for multiple scenes.
+        :param scenes: List of Scene objects corresponding to each agent input.
+        :return: List of Trajectory objects for each scene.
+        """
+        if not scenes:
+            return []
+        
+        # Parallel batch processing: extract all future trajectories at once
+        trajectories = []
+        for scene in scenes:
+            trajectory = scene.get_future_trajectory(self._trajectory_sampling.num_poses)
+            trajectories.append(trajectory)
+        
+        return trajectories

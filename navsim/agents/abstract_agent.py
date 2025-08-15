@@ -5,7 +5,7 @@ import pytorch_lightning as pl
 import torch
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
-from navsim.common.dataclasses import AgentInput, SensorConfig, Trajectory
+from navsim.common.dataclasses import AgentInput, Scene, SensorConfig, Trajectory
 from navsim.planning.training.abstract_feature_target_builder import AbstractFeatureBuilder, AbstractTargetBuilder
 
 
@@ -114,6 +114,27 @@ class AbstractAgent(torch.nn.Module, ABC):
         for poses in batch_poses:
             trajectories.append(Trajectory(poses, self._trajectory_sampling))
         
+        return trajectories
+
+    def compute_trajectories_batch_with_scenes(self, agent_inputs: List[AgentInput], scenes: List[Scene]) -> List[Trajectory]:
+        """
+        Computes ego vehicle trajectories for multiple scenes with scene data in a batch.
+        This method should be overridden by agents that require scene data and support batching.
+        
+        :param agent_inputs: List of AgentInput dataclasses for multiple scenes.
+        :param scenes: List of Scene objects corresponding to each agent input.
+        :return: List of Trajectory objects for each scene.
+        """
+        if not self.requires_scene:
+            # For agents that don't require scenes, delegate to regular batch processing
+            return self.compute_trajectories_batch(agent_inputs)
+        
+        # Default implementation: fall back to serial processing for compatibility
+        # Scene-requiring agents should override this method for true batch processing
+        trajectories = []
+        for agent_input, scene in zip(agent_inputs, scenes):
+            trajectory = self.compute_trajectory(agent_input, scene)
+            trajectories.append(trajectory)
         return trajectories
 
     def compute_loss(
